@@ -1,0 +1,14 @@
+{
+	"type": "mashup",
+	"name": "App to JSON (v2)",
+	"description": "A mashup that allows you to export multiple Qlik apps to JSON format.",
+	"version": "2.0.0",
+	"author": "AKN",
+	"homepage": "",
+	"keywords": "qlik-sense, visualization, mashup",
+	"license": "",
+	"repository": "",
+	"dependencies": {
+		"qlik-sense": ">=3.0.x"
+	}
+}
