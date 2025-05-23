@@ -309,7 +309,56 @@ require(["js/qlik", "jquery", "jszip"], function (qlik, $, JSZip) {
 
       const sheetList = await app.getList("sheet");
       if (sheetList && sheetList.layout && sheetList.layout.qAppObjectList) {
-        appData.sheets = sheetList.layout.qAppObjectList.qItems || [];
+        const sheets = sheetList.layout.qAppObjectList.qItems || [];
+        
+        appData.sheets = await Promise.all(sheets.map(async (sheet) => {
+          try {
+            const sheetObject = await app.getObject(sheet.qInfo.qId);
+            if (!sheetObject) return sheet;
+
+            const sheetProperties = await sheetObject.getProperties();
+            if (!sheetProperties) return sheet;
+
+            const enhancedSheet = {
+              ...sheet,
+              qProperty: sheetProperties
+            };
+
+            if (sheet.qData && sheet.qData.cells) {
+              const cellObjects = await Promise.all(sheet.qData.cells.map(async (cell) => {
+                try {
+                  if (!cell.name) return cell;
+                  
+                  const cellObject = await app.getObject(cell.name);
+                  if (!cellObject) return cell;
+
+                  const cellProperties = await cellObject.getProperties();
+                  if (!cellProperties) return cell;
+
+                  return {
+                    ...cell,
+                    qProperty: cellProperties
+                  };
+                } catch (error) {
+                  console.warn(`Failed to get properties for cell ${cell.name}:`, error);
+                  return cell;
+                }
+              }));
+
+              enhancedSheet.qData.cells = cellObjects;
+              if (!enhancedSheet.qChildren) {
+                enhancedSheet.qChildren = cellObjects.map(cell => ({
+                  qProperty: cell.qProperty
+                }));
+              }
+            }
+
+            return enhancedSheet;
+          } catch (error) {
+            console.warn(`Failed to get properties for sheet ${sheet.qInfo.qId}:`, error);
+            return sheet;
+          }
+        }));
       }
 
       const masterList = await app.getList("MasterObject");
