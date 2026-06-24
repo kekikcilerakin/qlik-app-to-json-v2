@@ -31,6 +31,8 @@ require(["js/qlik", "jquery", "jszip"], function (qlik, $, JSZip) {
     global: null,
   };
 
+  let activeOpenReject = null;
+
   const elements = {
     exportBtn: document.getElementById("exportBtn"),
     selectAll: document.getElementById("selectAll"),
@@ -63,6 +65,17 @@ require(["js/qlik", "jquery", "jszip"], function (qlik, $, JSZip) {
       state.global = qlik.getGlobal(config);
       if (!state.global) {
         throw new Error("Failed to establish Qlik connection");
+      }
+
+      if (typeof qlik.setOnError === "function") {
+        qlik.setOnError((error) => {
+          console.error("Qlik engine error:", error);
+          if (activeOpenReject) {
+            const reject = activeOpenReject;
+            activeOpenReject = null;
+            reject(new Error((error && error.message) || "Qlik engine error (access denied?)"));
+          }
+        });
       }
     } catch (error) {
       console.error("Connection error:", error);
@@ -207,6 +220,26 @@ require(["js/qlik", "jquery", "jszip"], function (qlik, $, JSZip) {
     elements.exportBtn.disabled = state.selectedApps.size === 0;
   };
 
+  const EXPORT_TIMEOUT_MS = 60000;
+
+  const withTimeout = (promise, ms, label) =>
+    Promise.race([
+      promise,
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error(`${label}: timed out after ${ms}ms`)), ms)
+      ),
+    ]);
+
+  const uniqueFileName = (usedNames, name) => {
+    let candidate = name;
+    let counter = 2;
+    while (usedNames.has(candidate)) {
+      candidate = `${name} (${counter++})`;
+    }
+    usedNames.add(candidate);
+    return candidate;
+  };
+
   const handleExport = async () => {
     if (state.isExporting) return;
 
@@ -218,22 +251,31 @@ require(["js/qlik", "jquery", "jszip"], function (qlik, $, JSZip) {
     try {
       const selectedApps = Array.from(state.selectedApps).map((app) => JSON.parse(app));
       const zip = new JSZip();
+      const usedNames = new Set();
+      const failed = [];
 
       for (let i = 0; i < selectedApps.length; i++) {
         const app = selectedApps[i];
         updateProgress(i, selectedApps.length);
 
         try {
-          const appData = await exportApp(app.id);
-          zip.file(`${app.name}.json`, JSON.stringify(appData, null, 2));
+          const appData = await withTimeout(exportApp(app.id), EXPORT_TIMEOUT_MS, app.name);
+          zip.file(`${uniqueFileName(usedNames, app.name)}.json`, JSON.stringify(appData, null, 2));
         } catch (error) {
           console.error(`Failed to export ${app.name}:`, error);
-          showError(`Failed to export ${app.name}`);
+          failed.push(app.name);
         }
       }
 
       updateProgress(selectedApps.length, selectedApps.length);
-      await downloadZip(zip);
+
+      if (Object.keys(zip.files).length > 0) {
+        await downloadZip(zip);
+      }
+
+      if (failed.length > 0) {
+        showError(`Could not export ${failed.length} app(s):\n${failed.join("\n")}`);
+      }
     } catch (error) {
       console.error("Export error:", error);
       showError("Export failed. Please try again.");
@@ -242,9 +284,17 @@ require(["js/qlik", "jquery", "jszip"], function (qlik, $, JSZip) {
     }
   };
 
+  const getEngineDoc = async (app) => {
+    for (let i = 0; i < 40 && !app.model.enigmaModel; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    return app.model.enigmaModel || null;
+  };
+
   const exportApp = async (appId) => {
+    let app;
     try {
-      const app = qlik.openApp(appId);
+      app = qlik.openApp(appId);
       if (!app) {
         throw new Error("Failed to open app");
       }
@@ -263,14 +313,41 @@ require(["js/qlik", "jquery", "jszip"], function (qlik, $, JSZip) {
         variables: [],
         stories: [],
         scripts: "",
-
-        // dataconnections: [],
       };
 
-      const appLayout = await app.getAppLayout();
+      const appLayout = await new Promise((resolve, reject) => {
+        activeOpenReject = reject;
+        app.getAppLayout().then(resolve, reject);
+      }).finally(() => {
+        activeOpenReject = null;
+      });
       if (appLayout && appLayout.layout) {
         appData.properties = appLayout.layout;
       }
+
+      const doc = await getEngineDoc(app);
+      if (!doc) {
+        console.warn("Engine doc unavailable; exporting list metadata only (no deep definitions).");
+      }
+
+      const enrich = (items, fetchDefinition) =>
+        Promise.all(
+          items.map(async (item) => {
+            const id = item.qInfo && item.qInfo.qId;
+            try {
+              return { ...item, ...(await fetchDefinition(id)) };
+            } catch (error) {
+              console.warn(`Failed to fetch definition for ${id}:`, error);
+              return item;
+            }
+          })
+        );
+
+      const fetchObjectTree = async (id) => {
+        const handle = await doc.getObject(id);
+        const tree = await handle.getFullPropertyTree();
+        return { qProperty: tree.qProperty, qChildren: tree.qChildren };
+      };
 
       const fieldList = await app.getList("FieldList");
       if (fieldList && fieldList.layout && fieldList.layout.qFieldList) {
@@ -279,17 +356,29 @@ require(["js/qlik", "jquery", "jszip"], function (qlik, $, JSZip) {
 
       const measureList = await app.getList("MeasureList");
       if (measureList && measureList.layout && measureList.layout.qMeasureList) {
-        appData.measures = measureList.layout.qMeasureList.qItems || [];
+        const items = measureList.layout.qMeasureList.qItems || [];
+        appData.measures = await enrich(items, async (id) => {
+          const handle = await doc.getMeasure(id);
+          return { qProperty: await handle.getProperties() };
+        });
       }
 
       const dimensionList = await app.getList("DimensionList");
       if (dimensionList && dimensionList.layout && dimensionList.layout.qDimensionList) {
-        appData.dimensions = dimensionList.layout.qDimensionList.qItems || [];
+        const items = dimensionList.layout.qDimensionList.qItems || [];
+        appData.dimensions = await enrich(items, async (id) => {
+          const handle = await doc.getDimension(id);
+          return { qProperty: await handle.getProperties() };
+        });
       }
 
       const bookmarkList = await app.getList("BookmarkList");
       if (bookmarkList && bookmarkList.layout && bookmarkList.layout.qBookmarkList) {
-        appData.bookmarks = bookmarkList.layout.qBookmarkList.qItems || [];
+        const items = bookmarkList.layout.qBookmarkList.qItems || [];
+        appData.bookmarks = await enrich(items, async (id) => {
+          const handle = await doc.getBookmark(id);
+          return { qProperty: await handle.getProperties() };
+        });
       }
 
       const selectionObjectList = await app.getList("SelectionObject");
@@ -304,66 +393,19 @@ require(["js/qlik", "jquery", "jszip"], function (qlik, $, JSZip) {
 
       const mediaList = await app.getList("MediaList");
       if (mediaList && mediaList.layout && mediaList.layout.qMediaList) {
-        appData.embeddedmedia = mediaList.layout.qMediaList.qItems || [];
+        appData.medias = mediaList.layout.qMediaList.qItems || [];
       }
 
       const sheetList = await app.getList("sheet");
       if (sheetList && sheetList.layout && sheetList.layout.qAppObjectList) {
-        const sheets = sheetList.layout.qAppObjectList.qItems || [];
-        
-        appData.sheets = await Promise.all(sheets.map(async (sheet) => {
-          try {
-            const sheetObject = await app.getObject(sheet.qInfo.qId);
-            if (!sheetObject) return sheet;
-
-            const sheetProperties = await sheetObject.getProperties();
-            if (!sheetProperties) return sheet;
-
-            const enhancedSheet = {
-              ...sheet,
-              qProperty: sheetProperties
-            };
-
-            if (sheet.qData && sheet.qData.cells) {
-              const cellObjects = await Promise.all(sheet.qData.cells.map(async (cell) => {
-                try {
-                  if (!cell.name) return cell;
-                  
-                  const cellObject = await app.getObject(cell.name);
-                  if (!cellObject) return cell;
-
-                  const cellProperties = await cellObject.getProperties();
-                  if (!cellProperties) return cell;
-
-                  return {
-                    ...cell,
-                    qProperty: cellProperties
-                  };
-                } catch (error) {
-                  console.warn(`Failed to get properties for cell ${cell.name}:`, error);
-                  return cell;
-                }
-              }));
-
-              enhancedSheet.qData.cells = cellObjects;
-              if (!enhancedSheet.qChildren) {
-                enhancedSheet.qChildren = cellObjects.map(cell => ({
-                  qProperty: cell.qProperty
-                }));
-              }
-            }
-
-            return enhancedSheet;
-          } catch (error) {
-            console.warn(`Failed to get properties for sheet ${sheet.qInfo.qId}:`, error);
-            return sheet;
-          }
-        }));
+        const items = sheetList.layout.qAppObjectList.qItems || [];
+        appData.sheets = await enrich(items, fetchObjectTree);
       }
 
       const masterList = await app.getList("MasterObject");
       if (masterList && masterList.layout && masterList.layout.qAppObjectList) {
-        appData.masterObjects = masterList.layout.qAppObjectList.qItems || [];
+        const items = masterList.layout.qAppObjectList.qItems || [];
+        appData.masterObjects = await enrich(items, fetchObjectTree);
       }
 
       const variableList = await app.getList("VariableList");
@@ -373,7 +415,8 @@ require(["js/qlik", "jquery", "jszip"], function (qlik, $, JSZip) {
 
       const storyList = await app.getList("story");
       if (storyList && storyList.layout && storyList.layout.qAppObjectList) {
-        appData.stories = storyList.layout.qAppObjectList.qItems || [];
+        const items = storyList.layout.qAppObjectList.qItems || [];
+        appData.stories = await enrich(items, fetchObjectTree);
       }
 
       const script = await app.getScript();
@@ -381,12 +424,14 @@ require(["js/qlik", "jquery", "jszip"], function (qlik, $, JSZip) {
         appData.scripts = script.qScript;
       }
 
-      // let dataConnectionList;
-
       return appData;
     } catch (error) {
       console.error("Error exporting app:", error);
       throw error;
+    } finally {
+      if (app && typeof app.close === "function") {
+        Promise.resolve(app.close()).catch((e) => console.warn("Failed to close app session:", e));
+      }
     }
   };
 
